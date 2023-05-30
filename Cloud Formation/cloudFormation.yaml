@@ -1,0 +1,873 @@
+Resources:
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: "incentivizeme-bucket"
+    
+  DynamoDbTableAttendances:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "attendances"
+      AttributeDefinitions:
+        -
+          AttributeName: "id"
+          AttributeType: "S"
+        -
+          AttributeName: "Bonus"
+          AttributeType: "N"
+        -
+          AttributeName: "employeeId"
+          AttributeType: "M"
+        -
+          AttributeName: "endDate"
+          AttributeType: "S"
+        -
+          AttributeName: "hours"
+          AttributeType: "N"
+        -
+          AttributeName: "projectId"
+          AttributeType: "M"
+        -
+          AttributeName: "startDate"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "id"
+          KeyType: "S"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+  
+  DynamoDbTableEmployees:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "employees"
+      AttributeDefinitions:
+        -
+          AttributeName: "id"
+          AttributeType: "S"
+        -
+          AttributeName: "email"
+          AttributeType: "S"
+        -
+          AttributeName: "name"
+          AttributeType: "S"
+        -
+          AttributeName: "phoneNumber"
+          AttributeType: "S"
+        -
+          AttributeName: "wage"
+          AttributeType: "N"
+      KeySchema:
+        -
+          AttributeName: "id"
+          KeyType: "S"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  DynamoDbTableProjects:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "projects"
+      AttributeDefinitions:
+        -
+          AttributeName: "id"
+          AttributeType: "S"
+        -
+          AttributeName: "budgetAmount"
+          AttributeType: "N"
+        -
+          AttributeName: "managerId"
+          AttributeType: "M"
+        -
+          AttributeName: "name"
+          AttributeType: "S"
+        -
+          AttributeName: "status"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "id"
+          KeyType: "S"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  SNSIncentiveMe:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "Incentive ME Topic"
+      TopicName: "incentvieme"
+  
+  LambdaIncentiveProjects:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+                  
+          dynamo = boto3.resource('dynamodb').Table('projects')
+
+          def lambda_handler(event, context):
+              body = ''
+              statusCode = 200
+              headers = {
+                  "Content-Type": "application/json",
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+              
+              try:
+                  print("event data: " + json.dumps(event))
+                  
+                  route = event['httpMethod'] + " " + event['resource']
+                  
+                  if route.startswith("DELETE /projects/"):
+                      id = event['pathParameters']['id']
+                      dynamo.delete_item(Key={'id': id})
+                      body = f"Deleted item {id}"
+                  
+                  elif route.startswith("GET /projects/"):
+                      id = event['pathParameters']['id']
+                      response = dynamo.get_item(Key={'id': id})
+                      body = response['Item']
+                      
+                  elif route == "GET /projects":
+                      response = dynamo.scan()
+                      body = response['Items']
+                      
+                  elif route == "PUT /projects":
+                      requestJSON = json.loads(event['body'])
+                      
+                      dynamo.put_item(Item={
+                          'id': requestJSON['id'],
+                          'name': requestJSON['name'],
+                          'status':requestJSON['status'],
+                          'managerId':requestJSON.get('managerId',{}),
+                          'budgetAmount':requestJSON['budgetAmount'],
+                      })
+                      body = requestJSON
+                  else:
+                      raise Exception(f"Unsupported route: \"{route} - EVENT: {json.dumps(event)}\"")
+              
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              
+              finally:
+                  body = json.dumps(body,cls=DecimalEncoder)
+              
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "incentivize-project"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::539789115280:role/LabRole"
+      Runtime: python3.7
+  
+  LambdaApproveProject:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+          eventbridge = boto3.client('events')
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('projects')
+
+          def lambda_handler(event, context):
+              requestJSON = json.loads(event['body'])
+              project_id = requestJSON['id']
+              headers = {
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'POST'
+              }
+              try:
+                  response = table.update_item(
+                      Key={
+                          'id': project_id
+                      },
+                      UpdateExpression='SET #s = :status',
+                      ExpressionAttributeNames={
+                          '#s': 'status'
+                      },
+                      ExpressionAttributeValues={
+                          ':status': 'approve'
+                      },
+                      ReturnValues="ALL_NEW"
+                  )
+                      
+                  attendance_table = dynamodb.Table('attendances')
+                  attendances = attendance_table.scan(
+                      FilterExpression='projectId.id = :id',
+                      ExpressionAttributeValues={
+                          ':id': project_id
+                      }
+                  )
+                  
+                  # Calculate the total amount earned by employees on this project
+                  total_earned = 0
+                  total_hours_worked = 0
+                  for attendance in attendances['Items']:
+                      total_earned += float(attendance['employeeId']['wage']) * float(attendance['hours'])
+                      total_hours_worked += float(attendance['hours'])
+                  
+                  # Query the project table for the project with the matching ID
+                  project_table = dynamodb.Table('projects')
+                  response = project_table.get_item(
+                      Key={
+                          'id': project_id
+                      }
+                  )
+                  # Calculate the remaining budget
+                  remaining_budget = float(response['Item']['budgetAmount']) - total_earned
+                  
+                  # Distribute the remaining budget to all attendances as per worked hours
+                  for attendance in attendances['Items']:
+                      hours_worked = float(attendance['hours'])
+                      Bonus = remaining_budget * (hours_worked / total_hours_worked)
+                      Bonus = decimal.Decimal(str(Bonus))
+                      attendance_table.update_item(
+                          Key={
+                              'id': attendance['id']
+                          },
+                          UpdateExpression='SET Bonus = :Bonus',
+                          ExpressionAttributeValues={
+                              ':Bonus': Bonus
+                          }
+                      )
+                  
+
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps(response, cls=DecimalEncoder)
+                  }
+              except dynamodb.meta.client.exceptions.ClientError as e:
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': error_message})
+                  }
+      FunctionName: "approveProject"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+
+  LambdaMarkPendingProject:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('projects')
+
+          def lambda_handler(event, context):
+              requestJSON = json.loads(event['body'])
+              project_id = requestJSON['id']
+              headers = {
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'POST'
+              }
+              try:
+                  response = table.update_item(
+                      Key={
+                          'id': project_id
+                      },
+                      UpdateExpression='SET #s = :status',
+                      ExpressionAttributeNames={
+                          '#s': 'status'
+                      },
+                      ExpressionAttributeValues={
+                          ':status': 'pending'
+                      },
+                      ReturnValues="ALL_NEW"
+                  )
+                  attendance_table = dynamodb.Table('attendances')
+                  attendances = attendance_table.scan(
+                      FilterExpression='projectId.id = :id',
+                      ExpressionAttributeValues={
+                          ':id': project_id
+                      }
+                  )
+                  
+                  for attendance in attendances['Items']:
+                      hours_worked = float(attendance['hours'])
+                      if attendance.get('Bonus'):
+                          attendance_table.update_item(
+                              Key={
+                                  'id': attendance['id']
+                              },
+                              UpdateExpression='SET Bonus = :Bonus',
+                              ExpressionAttributeValues={
+                                  ':Bonus': 0
+                              }
+                          )
+                      
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps(response, cls=DecimalEncoder)
+                  }
+              except dynamodb.meta.client.exceptions.ClientError as e:
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 404,
+                      'body': json.dumps({'error': error_message})
+                  }
+      FunctionName: "markPendingProject"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+
+  LambdaCreateProject:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+                  
+          dynamo = boto3.resource('dynamodb').Table('projects')
+
+          def lambda_handler(event, context):
+              body = ''
+              statusCode = 200
+              headers = {
+                  "Content-Type": "application/json",
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+              
+              try:
+                  print("event data: " + json.dumps(event))
+                  
+                  requestJSON = json.loads(event['body'])
+                  
+                  dynamo.put_item(Item={
+                      'id': requestJSON['id'],
+                      'name': requestJSON['name'],
+                      'status':requestJSON['status'],
+                      'managerId':requestJSON.get('managerId',{}),
+                      'budgetAmount':requestJSON['budgetAmount'],
+                  })
+                  
+                  
+                  # Create an SNS client
+                  sns = boto3.client('sns')
+                  
+                  # Get the ARN of the SNS topic to subscribe to
+                  topic_arn = 'arn:aws:sns:us-east-1:539789115280:incentvieme'
+                  
+                  # Subscribe to the SNS topic
+                  sns.subscribe(
+                      TopicArn=topic_arn,
+                      Protocol='email',
+                      Endpoint=requestJSON.get('managerId',{}).get('email')
+                  )
+                  
+                  # Publish a message to the SNS topic
+                  message = {'default': 'Your project has been successfully added to the projects dashboard'}
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Message=json.dumps(message),
+                      MessageStructure='json'
+                  )
+                  
+                  
+                  
+                  body = requestJSON
+              
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              
+              finally:
+                  body = json.dumps(body,cls=DecimalEncoder)
+              
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "createProject"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+
+  LambdaCreateAttendance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          dynamo = boto3.resource('dynamodb').Table('attendances')
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+                  
+          def lambda_handler(event, context):
+              statusCode = 200
+              body = ''
+              headers = {
+                  "Content-Type": "application/json",
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+              try:
+                  print("event data: " + json.dumps(event))
+                  requestJSON = json.loads(event['body'])
+                  hours_decimal = decimal.Decimal(str(requestJSON['hours']))
+
+                  dynamo.put_item(Item={
+                      'id': requestJSON['id'],
+                      'employeeId': requestJSON['employeeId'],
+                      'projectId': requestJSON['projectId'],
+                      'startDate': requestJSON['startDate'],
+                      'endDate': requestJSON['endDate'],
+                      'hours': hours_decimal
+                  })
+                  body = {
+                      'id': requestJSON['id'],
+                      'employeeId': requestJSON['employeeId'],
+                      'projectId': requestJSON['projectId'],
+                      'startDate': requestJSON['startDate'],
+                      'endDate': requestJSON['endDate'],
+                      'hours': hours_decimal
+                  }
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              finally:
+                  body = json.dumps(body,cls=DecimalEncoder)
+              
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "createAttendance"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+  
+  LambdaDeleteAttendance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          dynamo = boto3.resource('dynamodb').Table('attendances')
+
+          def lambda_handler(event, context):
+              body = ''
+              statusCode = 200
+              headers = {
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+              
+              try:
+                  print("event data: " + json.dumps(event))
+                  id = event['pathParameters']['id']
+                  dynamo.delete_item(Key={'id': id})
+              
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              
+              finally:
+                  body = json.dumps(body)
+              
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "deleteAttendance"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+  
+  LambdaUpdateAttendance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          dynamo = boto3.resource('dynamodb').Table('attendances')
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+                  
+          def lambda_handler(event, context):
+              statusCode = 200
+              body = ''
+              headers = {
+                  "Content-Type": "application/json",
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+              try:
+                  print("event data: " + json.dumps(event))
+                  requestJSON = json.loads(event['body'])
+                  hours_decimal = decimal.Decimal(str(requestJSON['hours']))
+
+                  dynamo.put_item(Item={
+                      'id': requestJSON['id'],
+                      'employeeId': requestJSON['employeeId'],
+                      'projectId': requestJSON['projectId'],
+                      'startDate': requestJSON['startDate'],
+                      'endDate': requestJSON['endDate'],
+                      'hours': hours_decimal
+                  })
+                  body = {
+                      'id': requestJSON['id'],
+                      'employeeId': requestJSON['employeeId'],
+                      'projectId': requestJSON['projectId'],
+                      'startDate': requestJSON['startDate'],
+                      'endDate': requestJSON['endDate'],
+                      'hours': hours_decimal
+                  }
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              finally:
+                  body = json.dumps(body,cls=DecimalEncoder)
+              
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "updateAttendance"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+  
+  LambdaGetAttendance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          dynamo = boto3.resource('dynamodb').Table('attendances')
+          import decimal
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+                  
+          def lambda_handler(event, context):
+              statusCode = 200
+              body = ''
+              headers = {
+                  "Content-Type": "application/json",
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET'
+              }
+              
+              try:
+                  print("event data: " + json.dumps(event))
+                  response = dynamo.scan()
+                  body = response['Items']
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              finally:
+                  body = json.dumps(body,cls=DecimalEncoder)
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "getlAttendances"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+
+  LambdaEmployee:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import decimal
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, decimal.Decimal):
+                      return str(obj)
+                  return super(DecimalEncoder, self).default(obj)
+                  
+          dynamo = boto3.resource('dynamodb').Table('employees')
+
+          def lambda_handler(event, context):
+              body = ''
+              statusCode = 200
+              headers = {
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+              
+              try:
+                  print("event data: " + json.dumps(event))
+                  
+                  route = event['httpMethod'] + " " + event['resource']
+                  
+                  if route.startswith("DELETE /employees/"):
+                      id = event['pathParameters']['id']
+                      dynamo.delete_item(Key={'id': id})
+                      body = f"Deleted item {id}"
+                  
+                  elif route.startswith("GET /employees/"):
+                      id = event['pathParameters']['id']
+                      response = dynamo.get_item(Key={'id': id})
+                      body = response['Item']
+                      
+                  elif route == "GET /employees":
+                      response = dynamo.scan()
+                      body = response['Items']
+                      
+                  elif route == "PUT /employees":
+                      requestJSON = json.loads(event['body'])
+                      dynamo.put_item(Item={
+                          'id': requestJSON['id'],
+                          'name': requestJSON['name'],
+                          'email': requestJSON['email'],
+                          'phoneNumber': requestJSON['phoneNumber'],
+                          'wage': requestJSON['wage'],
+                      })
+                      body = {
+                          'id': requestJSON['id'],
+                          'name': requestJSON['name'],
+                          'email': requestJSON['email'],
+                          'phoneNumber': requestJSON['phoneNumber'],
+                          'wage': requestJSON['wage'],
+                      }
+                  else:
+                      raise Exception(f"Unsupported route: \"{route} - EVENT: {json.dumps(event)}\"")
+              
+              except Exception as e:
+                  statusCode = 400
+                  body = str(e)
+              
+              finally:
+                  body = json.dumps(body,cls=DecimalEncoder)
+              
+              return {
+                  'statusCode': statusCode,
+                  'body': body,
+                  'headers': headers
+              }
+      FunctionName: "incentivize-employee"
+      Handler: lambda_function.lambda_handler
+      Role: !Sub "arn:aws:iam::016666178963:role/LabRole"
+      Runtime: python3.7
+
+  PermLambdaIncentiveProjects:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaIncentiveProjects
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+  
+  PermLambdaApproveProject:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaApproveProject
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaMarkPendingProject:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaMarkPendingProject
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaCreateProject:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaCreateProject
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaCreateAttendance:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaCreateAttendance
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaDeleteAttendance:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaDeleteAttendance
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaUpdateAttendance:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaUpdateAttendance
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaGetAttendance:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaGetAttendance
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  PermLambdaEmployee:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaEmployee
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+
+  RESTApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: incentivizeme
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  
+  ApiResourceApproveProject:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ParentId: !GetAtt RESTApiGateway.RootResourceId
+      PathPart: approveproject
+  
+  ApiResourceAttendance:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ParentId: !GetAtt RESTApiGateway.RootResourceId
+      PathPart: attendances
+  
+  ApiResourceUpdateAttendance:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ParentId: !GetAtt RESTApiGateway.RootResourceId
+      PathPart: attendances
+
+  ApiResourceEmployee:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ParentId: !GetAtt RESTApiGateway.RootResourceId
+      PathPart: employees
+
+  ApiResourceMarkPendingProject:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ParentId: !GetAtt RESTApiGateway.RootResourceId
+      PathPart: markpendingproject
+ 
+  ApiResourceProject:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ParentId: !GetAtt RESTApiGateway.RootResourceId
+      PathPart: projects
+
+  ApiGatewayMethodApproveProject:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ResourceId: !Ref ApiResourceApproveProject
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaApproveProject.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+  
+  ApiGatewayMethodAttendance:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RESTApiGateway
+      ResourceId: !Ref ApiResourceAttendance
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaApproveProject.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_TEMPLATES
